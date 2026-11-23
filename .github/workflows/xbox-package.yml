@@ -1,0 +1,77 @@
+name: Xbox package
+
+# Builds the Xbox Series UWP package of RetroArch from a branch of the
+# justinlindh/RetroArch fork, with the cores from an XboxEmulationHub
+# "AllCores" release copied in, so the result can replace that release on a
+# console. The package identity matches theirs; the version is raised per run
+# so Device Portal installs it as an upgrade.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit of justinlindh/RetroArch to build
+        required: true
+        default: xbox-shader-cache
+      cores_release:
+        description: XboxEmulationHub/RetroArch release tag to take the cores from
+        required: true
+        default: 08-19-2026
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-2025
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: justinlindh/RetroArch
+          ref: ${{ inputs.ref }}
+
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Bring in the cores
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.cores_release }}
+        run: |
+          $url = "https://github.com/XboxEmulationHub/RetroArch/releases/download/$env:TAG/RetroArch-SeriesConsoles-AllCores.appx"
+          Invoke-WebRequest -Uri $url -OutFile allcores.zip
+          Expand-Archive allcores.zip -DestinationPath allcores
+          $uwp = "pkg/msvc/msvc-uwp"
+          $coreDir = "$uwp/cores/x64/cores"
+          New-Item -ItemType Directory -Force $coreDir | Out-Null
+          Copy-Item allcores/cores/*.dll $coreDir
+          # Libraries some cores load from the package root. Skip the ones this
+          # build already ships (Mesa) and any name the packager mangled.
+          $own = Get-ChildItem "$uwp/MESA/x64/*.dll" | ForEach-Object Name
+          Get-ChildItem allcores/*.dll |
+            Where-Object { $own -notcontains $_.Name -and $_.Name -notmatch '%' } |
+            Copy-Item -Destination "$uwp/cores/x64/"
+          "cores: $((Get-ChildItem $coreDir/*.dll).Count)"
+          "root libraries: $((Get-ChildItem $uwp/cores/x64/*.dll).Count)"
+
+      - name: Raise the package version
+        shell: pwsh
+        run: |
+          $manifest = "pkg/msvc/msvc-uwp/Package.appxmanifest"
+          $xml = [xml](Get-Content $manifest)
+          $v = [version]$xml.Package.Identity.Version
+          $xml.Package.Identity.Version = "$($v.Major).$($v.Minor).$($v.Build).${{ github.run_number }}"
+          $xml.Save((Resolve-Path $manifest))
+          "version: $($xml.Package.Identity.Version)"
+
+      - name: Build
+        working-directory: pkg/msvc
+        run: msbuild -m -p:Configuration=Release -p:Platform=x64 .\RetroArch-msvc2026-UWP.sln
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: retroarch-xbox-${{ github.run_number }}
+          path: pkg/msvc/AppPackages/RetroArch-msvc2026-UWP
+          if-no-files-found: error
